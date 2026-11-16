@@ -48,6 +48,9 @@ int f() { return QString("x"); }' | qtcheck check --json
 # the Qt 5 leftovers in a file, with what to write instead
 qtcheck port legacy.cpp
 
+# check a whole qmake project: modules, sources and headers come from the .pro
+qtcheck project myapp.pro
+
 # rewrite the safe renames and re-verify the result with the compiler
 qtcheck port --write legacy.cpp
 
@@ -57,6 +60,12 @@ qtcheck doctor
 
 `check` flags: `--std c++17`, `--package Qt6Charts` (repeatable), `--include
 src/` (repeatable), `--timeout-ms 10000`, `--json`.
+
+`project` reads a subset of qmake — `QT`, `SOURCES`, `HEADERS`, `INCLUDEPATH`,
+`CONFIG += c++NN`, `TARGET` — resolves the paths against the `.pro` directory,
+and checks every file, running `moc` for the headers that declare a
+meta-object. It is not qmake: conditions, `include()` and computed values are
+ignored, and CMake is not supported yet.
 
 ## What it knows
 
@@ -98,8 +107,9 @@ not compile" from "this machine has no Qt".
 - **One file.** It type-checks syntax against Qt headers; it does not resolve
   headers you do not pass with `--include`, and it does not link, so missing
   definitions are not reported.
-- **Translation units, not projects.** For a real build, use CMake; this is for
-  the code that arrives faster than a build.
+- **Translation units, not projects.** `project` checks files one by one, not
+  the build: it uses no object files, so linking and missing definitions are
+  out of scope. For a real build, use CMake or qmake.
 - Verified on Qt 6.12.0 / g++ 16.2.1 / x86_64 Linux only.
 
 ## Licence

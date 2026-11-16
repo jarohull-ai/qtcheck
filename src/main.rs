@@ -57,6 +57,16 @@ enum Cmd {
         json: bool,
     },
 
+    /// Check every source and header named by a qmake .pro file.
+    Project {
+        /// Path to the .pro file.
+        pro: PathBuf,
+
+        /// Machine-readable report on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Report which Qt installation this tool would use.
     Doctor,
 }
@@ -271,6 +281,117 @@ fn main() -> ExitCode {
                     eprintln!("qtcheck: rewrote the file but cannot verify it: {e}");
                     ExitCode::from(4)
                 }
+            }
+        }
+
+        Cmd::Project { pro, json } => {
+            let spec = match qtcheck::project::parse(&pro) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    eprintln!("qtcheck: {e}");
+                    return ExitCode::from(4);
+                }
+            };
+            let opts = CheckOptions {
+                std_version: spec.std_version.clone(),
+                packages: spec.packages.clone(),
+                include_dirs: spec.include_dirs.clone(),
+                timeout_ms: 20_000,
+            };
+            let env = match detect_env(&opts.packages) {
+                Ok(env) => env,
+                Err(e) => {
+                    eprintln!("qtcheck: {e}");
+                    return ExitCode::from(4);
+                }
+            };
+
+            let mut results = Vec::new();
+            let mut failed = 0usize;
+            for file in &spec.files {
+                let file_name = file
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "snippet.cpp".to_string());
+                let report = match std::fs::read_to_string(file) {
+                    Ok(code) => check_with_env(&code, &file_name, &opts, &env),
+                    Err(e) => {
+                        failed += 1;
+                        if !json {
+                            println!("✗ {} — cannot read: {e}", file.display());
+                        }
+                        results.push(serde_json::json!({
+                            "path": file.display().to_string(),
+                            "success": false,
+                            "error": e.to_string(),
+                        }));
+                        continue;
+                    }
+                };
+                if !report.success {
+                    failed += 1;
+                }
+                if !json {
+                    let mark = if report.success { "✓" } else { "✗" };
+                    let moc = if report.moc_ran { ", moc" } else { "" };
+                    println!(
+                        "{mark} {}  ({} ms{moc})",
+                        file.display(),
+                        report.duration_ms.round()
+                    );
+                    for diagnostic in report.diagnostics.iter().filter(|d| d.severity != "warning").take(3) {
+                        println!(
+                            "    {} {}: {}",
+                            diagnostic.severity,
+                            diagnostic.line.unwrap_or(0),
+                            diagnostic.message
+                        );
+                    }
+                }
+                results.push(serde_json::json!({
+                    "path": file.display().to_string(),
+                    "success": report.success,
+                    "duration_ms": report.duration_ms.round(),
+                    "moc_ran": report.moc_ran,
+                    "diagnostics": report.diagnostics,
+                }));
+            }
+
+            let total = spec.files.len();
+            if json {
+                let payload = serde_json::json!({
+                    "project": pro.display().to_string(),
+                    "name": spec.name,
+                    "qt_version": env.qt_version,
+                    "packages": spec.packages,
+                    "std": spec.std_version,
+                    "total": total,
+                    "failed": failed,
+                    "files": results,
+                });
+                match serde_json::to_string_pretty(&payload) {
+                    Ok(text) => println!("{text}"),
+                    Err(e) => {
+                        eprintln!("qtcheck: cannot serialize report: {e}");
+                        return ExitCode::from(4);
+                    }
+                }
+            } else {
+                println!();
+                println!(
+                    "{}: {}/{} files clean (Qt {}, {})",
+                    spec.name,
+                    total - failed,
+                    total,
+                    env.qt_version,
+                    spec.std_version
+                );
+            }
+
+            if failed == 0 {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
             }
         }
 

@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 pub mod port;
+pub mod project;
 
 /// Default wall-clock budget for one check.
 pub const DEFAULT_TIMEOUT_MS: u64 = 10_000;

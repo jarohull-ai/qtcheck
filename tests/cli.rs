@@ -88,6 +88,46 @@ fn port_json_is_parseable() {
 }
 
 #[test]
+fn project_checks_every_file_named_by_the_pro() {
+    let dir = std::env::temp_dir().join(format!(
+        "qtcheck_pro_cli_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(dir.join("src")).expect("cannot create project dir");
+    std::fs::write(
+        dir.join("src/good.cpp"),
+        "#include <QString>\nQString ok() { return QStringLiteral(\"x\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/bad.cpp"),
+        "#include <QString>\nint nope() { return QString(\"x\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.pro"),
+        "QT += core\nCONFIG += c++17\nSOURCES += src/good.cpp src/bad.cpp\n",
+    )
+    .unwrap();
+
+    let pro = dir.join("app.pro").to_string_lossy().to_string();
+    let (code, stdout, stderr) = run(&["project", &pro], "");
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("1/2 files clean"), "stdout: {stdout}");
+
+    let (code, stdout, _) = run(&["project", &pro, "--json"], "");
+    assert_eq!(code, 1);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("report is not JSON");
+    assert_eq!(report["total"], serde_json::Value::from(2));
+    assert_eq!(report["failed"], serde_json::Value::from(1));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn port_write_rewrites_the_file_and_verifies_it() {
     let path = std::env::temp_dir().join(format!(
         "qtcheck_cli_{}_{}.cpp",
