@@ -57,9 +57,9 @@ enum Cmd {
         json: bool,
     },
 
-    /// Check every source and header named by a qmake .pro file.
+    /// Check every source and header named by a .pro or CMakeLists.txt.
     Project {
-        /// Path to the .pro file.
+        /// Path to the .pro file or CMakeLists.txt.
         pro: PathBuf,
 
         /// Machine-readable report on stdout.
@@ -285,7 +285,7 @@ fn main() -> ExitCode {
         }
 
         Cmd::Project { pro, json } => {
-            let spec = match qtcheck::project::parse(&pro) {
+            let spec = match qtcheck::project::parse_any(&pro) {
                 Ok(spec) => spec,
                 Err(e) => {
                     eprintln!("qtcheck: {e}");

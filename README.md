@@ -48,8 +48,9 @@ int f() { return QString("x"); }' | qtcheck check --json
 # the Qt 5 leftovers in a file, with what to write instead
 qtcheck port legacy.cpp
 
-# check a whole qmake project: modules, sources and headers come from the .pro
+# check a whole project: modules, sources and headers come from the project file
 qtcheck project myapp.pro
+qtcheck project CMakeLists.txt
 
 # rewrite the safe renames and re-verify the result with the compiler
 qtcheck port --write legacy.cpp
@@ -61,11 +62,22 @@ qtcheck doctor
 `check` flags: `--std c++17`, `--package Qt6Charts` (repeatable), `--include
 src/` (repeatable), `--timeout-ms 10000`, `--json`.
 
-`project` reads a subset of qmake — `QT`, `SOURCES`, `HEADERS`, `INCLUDEPATH`,
-`CONFIG += c++NN`, `TARGET` — resolves the paths against the `.pro` directory,
-and checks every file, running `moc` for the headers that declare a
-meta-object. It is not qmake: conditions, `include()` and computed values are
-ignored, and CMake is not supported yet.
+`project` accepts a qmake `.pro` file or a `CMakeLists.txt`, takes the modules,
+sources, headers, include directories and C++ standard from it, and checks every
+file, running `moc` for the headers that declare a meta-object.
+
+- **qmake**: `QT`, `SOURCES`, `HEADERS`, `INCLUDEPATH`, `CONFIG += c++NN`,
+  `TARGET`.
+- **CMake**: `find_package(Qt6 COMPONENTS ...)`, `target_link_libraries(...
+  Qt6::X)`, `add_executable` / `add_library` / `qt_add_executable` /
+  `target_sources` / `qt_add_qml_module`, `target_include_directories`,
+  `set(CMAKE_CXX_STANDARD ...)`, and simple `${VARIABLE}` expansion (including
+  CMake's own `${CMAKE_CURRENT_SOURCE_DIR}`).
+
+Neither is a build system: conditions, `include()`, functions and generator
+expressions are ignored, and unknown pieces are dropped rather than guessed. If
+the parsed file list looks wrong, the project file is more than this tool
+understands — use the build system instead.
 
 ## What it knows
 
@@ -110,6 +122,9 @@ not compile" from "this machine has no Qt".
 - **Translation units, not projects.** `project` checks files one by one, not
   the build: it uses no object files, so linking and missing definitions are
   out of scope. For a real build, use CMake or qmake.
+- **Not every CMake is understood.** `qt_add_qml_module` QML files are skipped
+  (no C++ compiler can check QML), and a project whose sources come from a
+  function call or a generator expression will be reported as having none.
 - Verified on Qt 6.12.0 / g++ 16.2.1 / x86_64 Linux only.
 
 ## Licence
