@@ -181,6 +181,40 @@ fn project_jobs_and_github_output_keep_the_same_verdict() {
 }
 
 #[test]
+fn a_project_that_names_no_files_is_not_reported_as_clean() {
+    let dir = std::env::temp_dir().join(format!(
+        "qtcheck_empty_cli_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("cannot create dir");
+    // A CMake project whose sources come from a function call: the parser
+    // cannot see them, and saying "clean" would be a lie.
+    std::fs::write(
+        dir.join("CMakeLists.txt"),
+        "cmake_minimum_required(VERSION 3.16)\nproject(app)\nfind_package(Qt6 COMPONENTS Core)\nmy_collect_sources(SOURCES)\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("empty.pro"), "QT += core\n").unwrap();
+
+    for name in ["CMakeLists.txt", "empty.pro"] {
+        let pro = dir.join(name).to_string_lossy().to_string();
+        let (code, stdout, stderr) = run(&["project", &pro], "");
+        assert_eq!(code, 4, "{name}: stdout: {stdout}\nstderr: {stderr}");
+        assert!(!stdout.contains("clean"), "{name}: false green: {stdout}");
+        assert!(
+            stderr.contains("qtcheck:") && stderr.contains("no "),
+            "{name}: stderr does not explain itself: {stderr}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn check_accepts_several_files_at_once() {
     let dir = std::env::temp_dir().join(format!(
         "qtcheck_many_cli_{}_{}",
