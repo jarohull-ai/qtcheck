@@ -1,6 +1,6 @@
 [package]
 name = "qtcheck"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Check Qt 6 code without building a project: compiler diagnostics plus the Qt 5 spellings Qt 6 removed."
 license = "MIT"

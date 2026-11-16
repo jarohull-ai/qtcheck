@@ -1,7 +1,7 @@
 use clap::error::ErrorKind;
 use clap::{Parser, Subcommand};
-use qtcheck::{check_with_env, detect_env, port, CheckOptions, DEFAULT_PACKAGES};
-use std::path::PathBuf;
+use qtcheck::{check_files, check_with_env, detect_env, port, CheckOptions, Diagnostic, DEFAULT_PACKAGES};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -17,10 +17,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Type-check one Qt 6 source file (or stdin) against the installed Qt.
+    /// Type-check Qt 6 source files against the installed Qt.
     Check {
-        /// Path to a .cpp/.h file. Omit to read stdin.
-        file: Option<PathBuf>,
+        /// Paths to .cpp/.h files. Omit to read stdin.
+        files: Vec<PathBuf>,
 
         /// Machine-readable report on stdout.
         #[arg(long)]
@@ -41,12 +41,20 @@ enum Cmd {
         /// Wall-clock budget for moc and the compiler, in milliseconds.
         #[arg(long, default_value_t = 10_000)]
         timeout_ms: u64,
+
+        /// Print GitHub Actions annotations instead of the human report.
+        #[arg(long)]
+        github: bool,
     },
 
     /// List Qt 5 spellings that Qt 6 removed, with the replacement for each.
     Port {
         /// Path to a .cpp/.h file. Omit to read stdin.
         file: Option<PathBuf>,
+
+        /// Scan every file named by a .pro or CMakeLists.txt instead of one file.
+        #[arg(long, value_name = "PROJECT", conflicts_with = "file")]
+        project: Option<PathBuf>,
 
         /// Rewrite the automatic renames in place.
         #[arg(long)]
@@ -65,6 +73,14 @@ enum Cmd {
         /// Machine-readable report on stdout.
         #[arg(long)]
         json: bool,
+
+        /// Print GitHub Actions annotations instead of the human report.
+        #[arg(long)]
+        github: bool,
+
+        /// Files to check at once. 0 picks the number of CPUs.
+        #[arg(long, default_value_t = 0)]
+        jobs: u64,
     },
 
     /// Report which Qt installation this tool would use.
@@ -102,6 +118,310 @@ fn options_from(
     }
 }
 
+/// How many files to check at once; `0` means one per CPU.
+fn job_count(requested: u64) -> usize {
+    if requested > 0 {
+        return requested.min(64) as usize;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+/// Escape one GitHub Actions annotation property (`%`, `\r`, `\n`, `,`, `:`
+/// would otherwise end the property or the command).
+fn escape_property(text: &str) -> String {
+    text.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+        .replace(',', "%2C")
+        .replace(':', "%3A")
+}
+
+/// Escape annotation message text: here a comma and colon are harmless.
+fn escape_message(text: &str) -> String {
+    text.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
+/// Print one compiler message as a GitHub Actions annotation, so the failure
+/// shows up on the changed line of a pull request instead of in a log.
+fn github_annotation(path: &str, diagnostic: &Diagnostic) {
+    let level = if diagnostic.severity == "warning" {
+        "warning"
+    } else {
+        "error"
+    };
+    let mut properties = vec![format!("file={}", escape_property(path))];
+    if let Some(line) = diagnostic.line {
+        properties.push(format!("line={line}"));
+        if let Some(column) = diagnostic.column {
+            properties.push(format!("col={column}"));
+        }
+    }
+    println!(
+        "::{level} {}::{}",
+        properties.join(","),
+        escape_message(&diagnostic.message)
+    );
+}
+
+/// Check several files, the way `qtcheck check src/*.cpp` should behave.
+fn check_many(
+    files: &[PathBuf],
+    json: bool,
+    github: bool,
+    std_version: String,
+    packages: &[String],
+    includes: &[PathBuf],
+    timeout_ms: u64,
+) -> ExitCode {
+    let opts = options_from(std_version, packages, includes, timeout_ms);
+    let env = match detect_env(&opts.packages) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("qtcheck: {e}");
+            return ExitCode::from(4);
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let outcomes = check_files(files, &opts, &env, job_count(0));
+
+    let mut failed = 0usize;
+    let mut records = Vec::new();
+    for (path, outcome) in files.iter().zip(outcomes) {
+        let shown = path.display().to_string();
+        match outcome {
+            Ok(report) => {
+                if !report.success {
+                    failed += 1;
+                }
+                if github {
+                    for diagnostic in &report.diagnostics {
+                        github_annotation(&shown, diagnostic);
+                    }
+                } else if !json {
+                    println!(
+                        "{} {shown}  ({} ms{})",
+                        if report.success { "✓" } else { "✗" },
+                        report.duration_ms.round(),
+                        if report.moc_ran { ", moc" } else { "" }
+                    );
+                    for diagnostic in report
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.severity != "warning")
+                        .take(3)
+                    {
+                        println!(
+                            "    {} {}: {}",
+                            diagnostic.severity,
+                            diagnostic.line.unwrap_or(0),
+                            diagnostic.message
+                        );
+                    }
+                }
+                records.push(serde_json::json!({
+                    "path": shown,
+                    "success": report.success,
+                    "duration_ms": report.duration_ms.round(),
+                    "moc_ran": report.moc_ran,
+                    "diagnostics": report.diagnostics,
+                }));
+            }
+            Err(e) => {
+                failed += 1;
+                if !json && !github {
+                    println!("✗ {shown} — {e}");
+                }
+                records.push(serde_json::json!({
+                    "path": shown,
+                    "success": false,
+                    "error": e,
+                }));
+            }
+        }
+    }
+
+    if json {
+        let payload = serde_json::json!({
+            "qt_version": env.qt_version,
+            "total": files.len(),
+            "failed": failed,
+            "files": records,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("qtcheck: cannot serialize report: {e}");
+                return ExitCode::from(4);
+            }
+        }
+    } else if !github {
+        println!();
+        println!(
+            "{}/{} files clean (Qt {}, {} ms)",
+            files.len() - failed,
+            files.len(),
+            env.qt_version,
+            started.elapsed().as_millis()
+        );
+    }
+
+    if failed == 0 {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
+/// Scan every file of a project for Qt 5 spellings, and optionally rewrite the
+/// safe ones — the actual migration job, not one file at a time.
+fn port_project(pro: &Path, write: bool, json: bool) -> ExitCode {
+    let spec = match qtcheck::project::parse_any(pro) {
+        Ok(spec) => spec,
+        Err(e) => {
+            eprintln!("qtcheck: {e}");
+            return ExitCode::from(4);
+        }
+    };
+
+    let mut total = 0usize;
+    let mut rewritable = 0usize;
+    let mut rewritten_files: Vec<PathBuf> = Vec::new();
+    let mut per_file = Vec::new();
+
+    for path in &spec.files {
+        let code = match std::fs::read_to_string(path) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("qtcheck: cannot read {}: {e}", path.display());
+                continue;
+            }
+        };
+        let hits = port::scan(&code);
+        if hits.is_empty() {
+            continue;
+        }
+        total += hits.len();
+        let auto = hits.iter().filter(|hit| hit.auto).count();
+        rewritable += auto;
+
+        if !json && !write {
+            println!("{}: {} Qt 5 spelling(s)", path.display(), hits.len());
+            for hit in &hits {
+                println!("  {}", hit.describe());
+                println!("      {}", hit.note);
+            }
+        }
+
+        if write && auto > 0 {
+            let (rewritten, applied) = port::apply(&code, &hits);
+            if applied > 0 {
+                if let Err(e) = std::fs::write(path, &rewritten) {
+                    eprintln!("qtcheck: cannot write {}: {e}", path.display());
+                    continue;
+                }
+                println!("rewrote {applied} occurrence(s) in {}", path.display());
+                rewritten_files.push(path.clone());
+            }
+        }
+
+        per_file.push(serde_json::json!({
+            "path": path.display().to_string(),
+            "hits": hits,
+        }));
+    }
+
+    if json {
+        let payload = serde_json::json!({
+            "project": pro.display().to_string(),
+            "name": spec.name,
+            "total": total,
+            "rewritable": rewritable,
+            "files": per_file,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{text}"),
+            Err(e) => {
+                eprintln!("qtcheck: cannot serialize findings: {e}");
+                return ExitCode::from(4);
+            }
+        }
+    } else if !write {
+        if total == 0 {
+            println!("no Qt 5 spellings found in {}", spec.name);
+        } else {
+            println!();
+            println!(
+                "{}: {total} Qt 5 spelling(s), {rewritable} rewritable automatically",
+                spec.name
+            );
+            if rewritable > 0 {
+                println!("Re-run with --write to apply the automatic ones.");
+            }
+        }
+    }
+
+    if !write {
+        return ExitCode::from(if total == 0 { 0 } else { 1 });
+    }
+    if rewritten_files.is_empty() {
+        println!("nothing to rewrite automatically");
+        return ExitCode::from(if total == 0 { 0 } else { 1 });
+    }
+
+    // The rewrite is only worth trusting if the result still compiles.
+    let opts = CheckOptions {
+        std_version: spec.std_version.clone(),
+        packages: spec.packages.clone(),
+        include_dirs: spec.include_dirs.clone(),
+        timeout_ms: 20_000,
+    };
+    let env = match detect_env(&opts.packages) {
+        Ok(env) => env,
+        Err(e) => {
+            eprintln!("qtcheck: rewrote {} file(s) but cannot verify them: {e}", rewritten_files.len());
+            return ExitCode::from(4);
+        }
+    };
+    let outcomes = check_files(&rewritten_files, &opts, &env, job_count(0));
+    let mut broken = 0usize;
+    for (path, outcome) in rewritten_files.iter().zip(outcomes) {
+        match outcome {
+            Ok(report) if report.success => {}
+            Ok(report) => {
+                broken += 1;
+                println!("✗ {} still fails after the rewrite:", path.display());
+                for diagnostic in report.diagnostics.iter().take(3) {
+                    println!(
+                        "    {} {}: {}",
+                        diagnostic.severity,
+                        diagnostic.line.unwrap_or(0),
+                        diagnostic.message
+                    );
+                }
+            }
+            Err(e) => {
+                broken += 1;
+                println!("✗ {}: {e}", path.display());
+            }
+        }
+    }
+    if broken == 0 {
+        println!(
+            "✓ all {} rewritten file(s) compile (Qt {})",
+            rewritten_files.len(),
+            env.qt_version
+        );
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    }
+}
+
 fn main() -> ExitCode {
     // Parse by hand: clap's default failure code (2) must not look like a
     // verdict from the compiler.
@@ -119,7 +439,11 @@ fn main() -> ExitCode {
     };
 
     match cli.cmd {
-        Cmd::Check { file, json, std, packages, includes, timeout_ms } => {
+        Cmd::Check { files, json, std, packages, includes, timeout_ms, github } => {
+            if files.len() > 1 {
+                return check_many(&files, json, github, std, &packages, &includes, timeout_ms);
+            }
+            let file = files.first().cloned();
             let code = match read_code(&file) {
                 Ok(code) => code,
                 Err(e) => {
@@ -143,7 +467,12 @@ fn main() -> ExitCode {
 
             let report = check_with_env(&code, &file_name, &opts, &env);
 
-            if json {
+            if github {
+                let path = file.as_ref().map(|p| p.display().to_string());
+                for diagnostic in &report.diagnostics {
+                    github_annotation(path.as_deref().unwrap_or("snippet.cpp"), diagnostic);
+                }
+            } else if json {
                 match serde_json::to_string_pretty(&report) {
                     Ok(text) => println!("{text}"),
                     Err(e) => {
@@ -192,7 +521,10 @@ fn main() -> ExitCode {
             ExitCode::from(report.cli_exit_code())
         }
 
-        Cmd::Port { file, write, json } => {
+        Cmd::Port { file, project, write, json } => {
+            if let Some(pro) = project {
+                return port_project(&pro, write, json);
+            }
             let code = match read_code(&file) {
                 Ok(code) => code,
                 Err(e) => {
@@ -284,7 +616,7 @@ fn main() -> ExitCode {
             }
         }
 
-        Cmd::Project { pro, json } => {
+        Cmd::Project { pro, json, github, jobs } => {
             let spec = match qtcheck::project::parse_any(&pro) {
                 Ok(spec) => spec,
                 Err(e) => {
@@ -306,19 +638,18 @@ fn main() -> ExitCode {
                 }
             };
 
+            let started = std::time::Instant::now();
+            let outcomes = check_files(&spec.files, &opts, &env, job_count(jobs));
+
             let mut results = Vec::new();
             let mut failed = 0usize;
-            for file in &spec.files {
-                let file_name = file
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "snippet.cpp".to_string());
-                let report = match std::fs::read_to_string(file) {
-                    Ok(code) => check_with_env(&code, &file_name, &opts, &env),
+            for (file, outcome) in spec.files.iter().zip(outcomes) {
+                let report = match outcome {
+                    Ok(report) => report,
                     Err(e) => {
                         failed += 1;
-                        if !json {
-                            println!("✗ {} — cannot read: {e}", file.display());
+                        if !json && !github {
+                            println!("✗ {} — {e}", file.display());
                         }
                         results.push(serde_json::json!({
                             "path": file.display().to_string(),
@@ -331,7 +662,11 @@ fn main() -> ExitCode {
                 if !report.success {
                     failed += 1;
                 }
-                if !json {
+                if github {
+                    for diagnostic in &report.diagnostics {
+                        github_annotation(&file.display().to_string(), diagnostic);
+                    }
+                } else if !json {
                     let mark = if report.success { "✓" } else { "✗" };
                     let moc = if report.moc_ran { ", moc" } else { "" };
                     println!(
@@ -339,7 +674,12 @@ fn main() -> ExitCode {
                         file.display(),
                         report.duration_ms.round()
                     );
-                    for diagnostic in report.diagnostics.iter().filter(|d| d.severity != "warning").take(3) {
+                    for diagnostic in report
+                        .diagnostics
+                        .iter()
+                        .filter(|d| d.severity != "warning")
+                        .take(3)
+                    {
                         println!(
                             "    {} {}: {}",
                             diagnostic.severity,
@@ -376,15 +716,27 @@ fn main() -> ExitCode {
                         return ExitCode::from(4);
                     }
                 }
+            } else if github {
+                // A clean project stays silent, so CI shows only real problems.
+                if failed > 0 {
+                    println!(
+                        "::error title={}::{} of {} files failed ({} ms)",
+                        escape_property(&format!("{} failed", spec.name)),
+                        failed,
+                        total,
+                        started.elapsed().as_millis()
+                    );
+                }
             } else {
                 println!();
                 println!(
-                    "{}: {}/{} files clean (Qt {}, {})",
+                    "{}: {}/{} files clean (Qt {}, {}, {} ms)",
                     spec.name,
                     total - failed,
                     total,
                     env.qt_version,
-                    spec.std_version
+                    spec.std_version,
+                    started.elapsed().as_millis()
                 );
             }
 

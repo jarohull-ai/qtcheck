@@ -38,8 +38,9 @@ Needs a C++ compiler, `pkg-config` and Qt 6 development files
 ## Use
 
 ```bash
-# check a file
+# check a file, or a shell glob of files (checked in parallel)
 qtcheck check widget.cpp
+qtcheck check src/*.cpp
 
 # check stdin, machine-readable
 echo '#include <QString>
@@ -52,7 +53,11 @@ qtcheck port legacy.cpp
 qtcheck project myapp.pro
 qtcheck project CMakeLists.txt
 
-# rewrite the safe renames and re-verify the result with the compiler
+# the migration job: every leftover in the project, then rewrite the safe ones
+qtcheck port --project myapp.pro
+qtcheck port --project myapp.pro --write
+
+# rewrite the safe renames in one file and re-verify it with the compiler
 qtcheck port --write legacy.cpp
 
 # what Qt will be used
@@ -60,7 +65,37 @@ qtcheck doctor
 ```
 
 `check` flags: `--std c++17`, `--package Qt6Charts` (repeatable), `--include
-src/` (repeatable), `--timeout-ms 10000`, `--json`.
+src/` (repeatable), `--timeout-ms 10000`, `--json`, `--github`.
+`project` flags: `--jobs N` (`0` = one per CPU), `--json`, `--github`.
+
+### Speed
+
+Files are independent compilations, so `project` and multi-file `check` run one
+per CPU. Measured on this machine (12 threads, Qt 6.12.0, release build):
+
+| project | files | `--jobs 1` | default |
+|---|---|---|---|
+| astramon | 5 | 6.59 s | **1.67 s** |
+| xcratesx | 7 | 9.42 s | **2.10 s** |
+
+One file costs 0.7–1.7 s, and 32 ms of that is the tool — the rest is the C++
+compiler reading Qt headers.
+
+### In CI
+
+`--github` prints [workflow commands](https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions)
+instead of a report, so failures appear on the changed line of the pull request:
+
+```yaml
+- name: Check Qt code
+  run: |
+    cargo install --path . --locked
+    qtcheck project CMakeLists.txt --github
+```
+
+A clean project prints nothing and exits 0. The exit code still distinguishes a
+broken project (1) from a broken toolchain (4), so a missing Qt does not look
+like a code failure.
 
 `project` accepts a qmake `.pro` file or a `CMakeLists.txt`, takes the modules,
 sources, headers, include directories and C++ standard from it, and checks every
@@ -116,12 +151,17 @@ not compile" from "this machine has no Qt".
 ## Limits
 
 - **Qt 6 only.** No Qt 5 mode.
-- **One file.** It type-checks syntax against Qt headers; it does not resolve
+- **Headers are checked as if they were sources.** A header that needs a macro
+  or an include only the build system provides will look broken here; pass
+  `--include` for its directory, or check the `.cpp` that uses it.
+- **One translation unit at a time.** It type-checks syntax against Qt headers; it does not resolve
   headers you do not pass with `--include`, and it does not link, so missing
   definitions are not reported.
 - **Translation units, not projects.** `project` checks files one by one, not
   the build: it uses no object files, so linking and missing definitions are
   out of scope. For a real build, use CMake or qmake.
+- **`--jobs` trades memory for speed.** Each worker is a compiler process over
+  Qt headers; on a small machine `--jobs 2` may be faster than thrashing.
 - **Not every CMake is understood.** `qt_add_qml_module` QML files are skipped
   (no C++ compiler can check QML), and a project whose sources come from a
   function call or a generator expression will be reported as having none.

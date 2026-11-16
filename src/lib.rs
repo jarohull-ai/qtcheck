@@ -14,6 +14,8 @@ use serde::Serialize;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 pub mod port;
@@ -213,6 +215,14 @@ trait Pipe: Sized {
 }
 impl Pipe for std::process::Output {}
 
+/// Headers are checked as standalone translation units, which needs a little
+/// tolerance a normal build does not.
+fn is_header(file_name: &str) -> bool {
+    [".h", ".hpp", ".hh", ".hxx", ".h++"]
+        .iter()
+        .any(|ext| file_name.ends_with(ext))
+}
+
 /// Does this source declare a meta-object that `moc` has to process?
 pub fn needs_moc(code: &str) -> bool {
     ["Q_OBJECT", "Q_GADGET", "Q_NAMESPACE", "Q_NAMESPACE_EXPORT"]
@@ -298,6 +308,12 @@ pub fn check_with_env(
     cmd.arg(format!("-std={}", opts.std_version))
         .arg("-fsyntax-only")
         .arg("-fPIC");
+    if is_header(file_name) {
+        // A header checked on its own is not the "main file" `#pragma once` is
+        // written for, so every project header would warn about it. The warning
+        // comes from how this tool works, not from the header.
+        cmd.arg("-Wno-pragma-once-outside-header");
+    }
     for flag in &env.cflags {
         cmd.arg(flag);
     }
@@ -378,11 +394,20 @@ pub fn check_with_env(
 }
 
 fn temp_dir() -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("qtcheck_{}_{}", std::process::id(), nanos))
+    // Checks run in parallel in one process, so the clock alone is not enough
+    // to keep two of them out of each other's scratch directory.
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "qtcheck_{}_{}_{}",
+        std::process::id(),
+        nanos,
+        seq
+    ))
 }
 
 fn spawn_reader<T: Read + Send + 'static>(mut pipe: T) -> std::thread::JoinHandle<Vec<u8>> {
@@ -417,6 +442,51 @@ fn tooling_failure(message: String, code: &str) -> CheckReport {
         },
         stderr: String::new(),
     }
+}
+
+/// Check many files at once, `jobs` at a time, and return one outcome per file
+/// in the order the files were given.
+///
+/// A project check is `N` independent compilations, so the wall-clock cost was
+/// `N` times one file. Nothing here is shared between files except the detected
+/// environment, which is read-only, so the work parallelises cleanly.
+///
+/// An `Err` is a file that could not be read; the rest still get checked.
+pub fn check_files(
+    files: &[PathBuf],
+    opts: &CheckOptions,
+    env: &QtEnv,
+    jobs: usize,
+) -> Vec<Result<CheckReport, String>> {
+    let jobs = jobs.max(1).min(files.len().max(1));
+    let next = AtomicUsize::new(0);
+    let finished: Mutex<Vec<(usize, Result<CheckReport, String>)>> = Mutex::new(Vec::new());
+
+    std::thread::scope(|scope| {
+        for _ in 0..jobs {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(path) = files.get(index) else {
+                    break;
+                };
+                let outcome = match std::fs::read_to_string(path) {
+                    Ok(code) => {
+                        let file_name = path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "snippet.cpp".to_string());
+                        Ok(check_with_env(&code, &file_name, opts, env))
+                    }
+                    Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+                };
+                finished.lock().expect("result lock poisoned").push((index, outcome));
+            });
+        }
+    });
+
+    let mut outcomes = finished.into_inner().expect("result lock poisoned");
+    outcomes.sort_by_key(|(index, _)| *index);
+    outcomes.into_iter().map(|(_, outcome)| outcome).collect()
 }
 
 /// Turn `g++`'s human output into `path:line:col: error: message` records.
@@ -521,6 +591,36 @@ mod tests {
         assert!(!bad.success);
         assert_eq!(bad.cli_exit_code(), 1);
         assert!(!bad.diagnostics.is_empty(), "no diagnostics parsed");
+    }
+
+    #[test]
+    fn parallel_check_keeps_the_file_order_and_every_verdict() {
+        let env = match detect_env(&DEFAULT_PACKAGES.iter().map(|p| p.to_string()).collect::<Vec<_>>()) {
+            Ok(env) => env,
+            Err(e) => panic!("this test needs Qt 6 development files: {e}"),
+        };
+        let dir = temp_dir();
+        std::fs::create_dir_all(&dir).expect("cannot create scratch dir");
+        let names = ["a.cpp", "b.cpp", "c.cpp", "d.cpp"];
+        // Every other file is broken, so a mixed-up result is visible.
+        for (i, name) in names.iter().enumerate() {
+            let code = if i % 2 == 0 {
+                "#include <QString>\nQString ok() { return QStringLiteral(\"x\"); }\n"
+            } else {
+                "#include <QString>\nint bad() { return QString(\"x\"); }\n"
+            };
+            std::fs::write(dir.join(name), code).expect("cannot write fixture");
+        }
+        let files: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+
+        let outcomes = check_files(&files, &CheckOptions::default(), &env, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(outcomes.len(), files.len());
+        for (i, outcome) in outcomes.iter().enumerate() {
+            let report = outcome.as_ref().unwrap_or_else(|e| panic!("{} failed: {e}", names[i]));
+            assert_eq!(report.success, i % 2 == 0, "verdict for {} is wrong", names[i]);
+        }
     }
 
     #[test]

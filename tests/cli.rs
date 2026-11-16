@@ -128,6 +128,124 @@ fn project_checks_every_file_named_by_the_pro() {
 }
 
 #[test]
+fn project_jobs_and_github_output_keep_the_same_verdict() {
+    let dir = std::env::temp_dir().join(format!(
+        "qtcheck_jobs_cli_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(dir.join("src")).expect("cannot create project dir");
+    std::fs::write(
+        dir.join("src/good.cpp"),
+        "#include <QString>\nQString ok() { return QStringLiteral(\"x\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("src/bad.cpp"),
+        "#include <QString>\nint nope() { return QString(\"x\"); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.pro"),
+        "QT += core\nCONFIG += c++17\nSOURCES += src/good.cpp src/bad.cpp\n",
+    )
+    .unwrap();
+    let pro = dir.join("app.pro").to_string_lossy().to_string();
+
+    // One worker must reach the same verdict as all of them.
+    let (code, stdout, stderr) = run(&["project", &pro, "--jobs", "1"], "");
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("1/2 files clean"), "stdout: {stdout}");
+
+    let (code, stdout, stderr) = run(&["project", &pro, "--jobs", "4"], "");
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("1/2 files clean"), "stdout: {stdout}");
+
+    // GitHub annotations: one machine-readable line per problem, pointing at
+    // the file and line, and a job-level failure for the summarised exit.
+    let (code, stdout, _) = run(&["project", &pro, "--github", "--jobs", "1"], "");
+    assert_eq!(code, 1);
+    assert!(
+        stdout.contains("::error file=") && stdout.contains(",line="),
+        "no annotation with a location: {stdout}"
+    );
+    assert!(
+        stdout.contains("bad.cpp"),
+        "the annotation does not name the failing file: {stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn check_accepts_several_files_at_once() {
+    let dir = std::env::temp_dir().join(format!(
+        "qtcheck_many_cli_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("cannot create dir");
+    let good = dir.join("good.cpp");
+    let bad = dir.join("bad.cpp");
+    std::fs::write(&good, GOOD).unwrap();
+    std::fs::write(&bad, BAD_TYPE).unwrap();
+    let (good, bad) = (
+        good.to_string_lossy().to_string(),
+        bad.to_string_lossy().to_string(),
+    );
+
+    let (code, stdout, stderr) = run(&["check", &good, &bad], "");
+    assert_eq!(code, 1, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("1/2 files clean"), "stdout: {stdout}");
+    assert!(stdout.contains("bad.cpp"), "stdout: {stdout}");
+
+    let (code, stdout, _) = run(&["check", &good, &bad, "--json"], "");
+    assert_eq!(code, 1);
+    let report: serde_json::Value = serde_json::from_str(&stdout).expect("report is not JSON");
+    assert_eq!(report["total"], serde_json::Value::from(2));
+    assert_eq!(report["failed"], serde_json::Value::from(1));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn port_rewrites_a_whole_project_and_verifies_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "qtcheck_port_proj_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(dir.join("src")).expect("cannot create project dir");
+    std::fs::write(dir.join("src/legacy.cpp"), QT5_LEFTOVER).unwrap();
+    std::fs::write(
+        dir.join("app.pro"),
+        "QT += core\nCONFIG += c++17\nSOURCES += src/legacy.cpp\n",
+    )
+    .unwrap();
+    let pro = dir.join("app.pro").to_string_lossy().to_string();
+
+    let (code, stdout, stderr) = run(&["port", "--project", &pro, "--write"], "");
+    let rewritten = std::fs::read_to_string(dir.join("src/legacy.cpp")).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(code, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(rewritten.contains("Qt::SkipEmptyParts"), "file: {rewritten}");
+    assert!(
+        stdout.contains("compile"),
+        "the project rewrite was not verified with the compiler: {stdout}"
+    );
+}
+
+#[test]
 fn port_write_rewrites_the_file_and_verifies_it() {
     let path = std::env::temp_dir().join(format!(
         "qtcheck_cli_{}_{}.cpp",
