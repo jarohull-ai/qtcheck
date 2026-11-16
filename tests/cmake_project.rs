@@ -14,6 +14,9 @@ const CMAKE_LISTS: &str = r#"cmake_minimum_required(VERSION 3.21)
 project(qtcheck_fixture LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
+# Turns on AUTOMOC: without it the Q_OBJECT class has no vtable and the link
+# fails, which is a property of a real Qt project rather than of this test.
+qt_standard_project_setup()
 set(APP_SOURCES main.cpp widget.cpp)
 qt_add_executable(app ${APP_SOURCES} widget.h)
 target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
