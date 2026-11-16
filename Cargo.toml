@@ -1,0 +1,21 @@
+[package]
+name = "qtcheck"
+version = "0.1.0"
+edition = "2021"
+description = "Check Qt 6 code without building a project: compiler diagnostics plus the Qt 5 spellings Qt 6 removed."
+license = "MIT"
+keywords = ["qt", "qt6", "verifier", "cpp", "llm"]
+categories = ["development-tools", "command-line-utilities"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[lib]
+name = "qtcheck"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qtcheck"
+path = "src/main.rs"

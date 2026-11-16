@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Real Qt headers and moc: every rule in the migration table is verified
+      # by compiling both sides, so this job fails if a rule goes stale.
+      - name: Qt 6 development files
+        run: sudo apt-get update && sudo apt-get install -y qt6-base-dev
+
+      - name: Toolchain
+        run: rustc --version && c++ --version | head -1 && pkg-config --modversion Qt6Core
+
+      - name: Test
+        run: cargo test --locked --all-targets
